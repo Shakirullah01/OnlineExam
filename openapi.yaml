@@ -1,0 +1,182 @@
+openapi: 3.0.3
+info:
+  title: Online Exam
+  version: 1.0.0
+  description: Teacher creates an exam. Student starts it, submits answers, and sees the score.
+servers:
+  - url: http://localhost:8081
+    description: Exam service
+  - url: http://localhost:8082
+    description: Result service
+paths:
+  /health:
+    get:
+      summary: Check that the service and its database are up
+      responses:
+        "200":
+          description: ok
+  /exams:
+    get:
+      summary: List exams without the correct answers
+      servers:
+        - url: http://localhost:8081
+      responses:
+        "200":
+          description: Exam list
+    post:
+      summary: Teacher creates an exam
+      servers:
+        - url: http://localhost:8081
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateExam"
+            example:
+              title: Go basics
+              teacher_id: 1
+              duration_minutes: 20
+              questions:
+                - body: What is 2 + 2?
+                  correct_option: 2
+                  options: ["3", "4", "5", "6"]
+      responses:
+        "201":
+          description: Created. The correct option is not returned.
+        "400":
+          description: The exam breaks a rule
+  /exams/{id}/start:
+    post:
+      summary: Student starts an exam and receives the questions
+      servers:
+        - url: http://localhost:8081
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [student_id]
+              properties:
+                student_id:
+                  type: integer
+            example:
+              student_id: 7
+      responses:
+        "200":
+          description: Questions without the correct option
+        "404":
+          description: Exam not found
+        "409":
+          description: This student already submitted this exam
+  /attempts/{id}/submit:
+    post:
+      summary: Student submits answers and receives the score
+      servers:
+        - url: http://localhost:8081
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Submit"
+            example:
+              answers:
+                - question_id: 1
+                  selected_option: 2
+      responses:
+        "200":
+          description: Score from the result service
+        "400":
+          description: Not every question was answered once
+        "409":
+          description: Already submitted
+  /results:
+    get:
+      summary: Past scores for one student
+      servers:
+        - url: http://localhost:8082
+      parameters:
+        - name: student_id
+          in: query
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Score list
+  /results/{id}:
+    get:
+      summary: One score. Redis may already have it.
+      servers:
+        - url: http://localhost:8082
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: One score
+        "404":
+          description: Result not found
+components:
+  schemas:
+    CreateExam:
+      type: object
+      required: [title, teacher_id, duration_minutes, questions]
+      properties:
+        title:
+          type: string
+        teacher_id:
+          type: integer
+        duration_minutes:
+          type: integer
+        questions:
+          type: array
+          items:
+            type: object
+            required: [body, correct_option, options]
+            properties:
+              body:
+                type: string
+              correct_option:
+                type: integer
+                minimum: 1
+                maximum: 4
+              options:
+                type: array
+                minItems: 4
+                maxItems: 4
+                items:
+                  type: string
+    Submit:
+      type: object
+      required: [answers]
+      properties:
+        answers:
+          type: array
+          items:
+            type: object
+            required: [question_id, selected_option]
+            properties:
+              question_id:
+                type: integer
+              selected_option:
+                type: integer
+                minimum: 1
+                maximum: 4

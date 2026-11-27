@@ -8,9 +8,15 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
+	"github.com/segmentio/kafka-go"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
+	"github.com/Shakirullah01/OnlineExam/result-service/resultpb"
 )
 
 // schema.sql is packed into the program, so it runs no matter which folder we start from.
@@ -18,41 +24,80 @@ import (
 //go:embed schema.sql
 var schemaFile embed.FS
 
-func main() {
-	ctx := context.Background()
+type app struct {
+	db     *pgxpool.Pool
+	cache  *redis.Client
+	events *kafka.Writer
+	grader resultpb.ResultClient
+}
 
+func main() {
+	log.Fatal(run(context.Background()))
+}
+
+func run(ctx context.Context) error {
+	service, err := connect(ctx)
+	if err != nil {
+		return err
+	}
+
+	go service.listenForGrades(ctx)
+
+	server := &http.Server{Addr: ":8081", Handler: service.routes()}
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		server.Shutdown(shutdownCtx)
+	}()
+
+	log.Println("exam-service is listening on http://localhost:8081")
+	err = server.ListenAndServe()
+	if err == http.ErrServerClosed {
+		return nil
+	}
+	return err
+}
+
+func connect(ctx context.Context) (*app, error) {
 	db, err := pgxpool.New(ctx, "postgres://admin:admin@localhost:5432/exam_db?sslmode=disable")
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
-	defer db.Close()
-
 	if err := db.Ping(ctx); err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
-
 	if err := createTables(ctx, db); err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
 
 	cache := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
 	if err := cache.Ping(ctx).Err(); err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
-		if err := db.Ping(r.Context()); err != nil {
-			http.Error(w, "database is down", http.StatusServiceUnavailable)
-			return
-		}
-		w.Write([]byte("ok"))
-	})
-	mux.HandleFunc("GET /exams", listExams(db, cache))
-	mux.HandleFunc("POST /exams", createExam(db, cache))
+	broker, err := kafka.Dial("tcp", "localhost:9092")
+	if err != nil {
+		return nil, err
+	}
+	broker.Close()
 
-	log.Println("exam-service is listening on http://localhost:8081")
-	log.Fatal(http.ListenAndServe(":8081", mux))
+	graderConn, err := grpc.NewClient("localhost:50051", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return nil, err
+	}
+
+	return &app{
+		db:    db,
+		cache: cache,
+		events: &kafka.Writer{
+			Addr:                   kafka.TCP("localhost:9092"),
+			AllowAutoTopicCreation: true,
+			Balancer:               &kafka.LeastBytes{},
+			BatchTimeout:           10 * time.Millisecond,
+		},
+		grader: resultpb.NewResultClient(graderConn),
+	}, nil
 }
 
 func createTables(ctx context.Context, db *pgxpool.Pool) error {
@@ -72,6 +117,37 @@ func createTables(ctx context.Context, db *pgxpool.Pool) error {
 		}
 	}
 	return nil
+}
+
+func (a *app) routes() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", a.health)
+	mux.HandleFunc("GET /exams", a.listExams)
+	mux.HandleFunc("POST /exams", a.createExam)
+	mux.HandleFunc("POST /exams/{id}/start", a.startAttempt)
+	mux.HandleFunc("POST /attempts/{id}/submit", a.submitAttempt)
+	return cors(mux)
+}
+
+func cors(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (a *app) health(w http.ResponseWriter, r *http.Request) {
+	if err := a.db.Ping(r.Context()); err != nil {
+		http.Error(w, "database is down", http.StatusServiceUnavailable)
+		return
+	}
+	w.Write([]byte("ok"))
 }
 
 type examRequest struct {
@@ -100,143 +176,143 @@ type examListItem struct {
 	DurationMinutes int    `json:"duration_minutes"`
 }
 
-func listExams(db *pgxpool.Pool, cache *redis.Client) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		ctx := r.Context()
+func (a *app) listExams(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 
-		cached, err := cache.Get(ctx, "exams:all").Bytes()
-		if err == nil {
-			w.Header().Set("Content-Type", "application/json")
-			w.Write(cached)
-			return
-		}
-		if err != redis.Nil {
-			log.Println(err)
-		}
-
-		rows, err := db.Query(ctx,
-			`SELECT id, title, teacher_id, duration_minutes
-			 FROM exams
-			 ORDER BY id`)
-		if err != nil {
-			log.Println(err)
-			http.Error(w, "could not load exams", http.StatusInternalServerError)
-			return
-		}
-		defer rows.Close()
-
-		exams := []examListItem{}
-		for rows.Next() {
-			var exam examListItem
-			if err := rows.Scan(&exam.ID, &exam.Title, &exam.TeacherID, &exam.DurationMinutes); err != nil {
-				log.Println(err)
-				http.Error(w, "could not load exams", http.StatusInternalServerError)
-				return
-			}
-			exams = append(exams, exam)
-		}
-		if err := rows.Err(); err != nil {
-			log.Println(err)
-			http.Error(w, "could not load exams", http.StatusInternalServerError)
-			return
-		}
-
-		body, err := json.Marshal(exams)
-		if err != nil {
-			log.Println(err)
-			http.Error(w, "could not load exams", http.StatusInternalServerError)
-			return
-		}
-		if err := cache.Set(ctx, "exams:all", body, 0).Err(); err != nil {
-			log.Println(err)
-		}
-
+	cached, err := a.cache.Get(ctx, "exams:all").Bytes()
+	if err == nil {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write(body)
+		w.Write(cached)
+		return
 	}
+	if err != redis.Nil {
+		log.Println(err)
+	}
+
+	rows, err := a.db.Query(ctx,
+		`SELECT id, title, teacher_id, duration_minutes
+		 FROM exams
+		 ORDER BY id`)
+	if err != nil {
+		log.Println(err)
+		http.Error(w, "could not load exams", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	exams := []examListItem{}
+	for rows.Next() {
+		var exam examListItem
+		if err := rows.Scan(&exam.ID, &exam.Title, &exam.TeacherID, &exam.DurationMinutes); err != nil {
+			log.Println(err)
+			http.Error(w, "could not load exams", http.StatusInternalServerError)
+			return
+		}
+		exams = append(exams, exam)
+	}
+	if err := rows.Err(); err != nil {
+		log.Println(err)
+		http.Error(w, "could not load exams", http.StatusInternalServerError)
+		return
+	}
+
+	body, err := json.Marshal(exams)
+	if err != nil {
+		log.Println(err)
+		http.Error(w, "could not load exams", http.StatusInternalServerError)
+		return
+	}
+	if err := a.cache.Set(ctx, "exams:all", body, 0).Err(); err != nil {
+		log.Println(err)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(body)
 }
 
-func createExam(db *pgxpool.Pool, cache *redis.Client) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		var req examRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "invalid json", http.StatusBadRequest)
-			return
-		}
-		if err := validateExam(req); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
+func (a *app) createExam(w http.ResponseWriter, r *http.Request) {
+	var req examRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	if err := validateExam(req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
-		ctx := r.Context()
-		tx, err := db.Begin(ctx)
-		if err != nil {
-			log.Println(err)
-			http.Error(w, "could not save exam", http.StatusInternalServerError)
-			return
-		}
-		defer tx.Rollback(ctx)
+	ctx := r.Context()
+	tx, err := a.db.Begin(ctx)
+	if err != nil {
+		log.Println(err)
+		http.Error(w, "could not save exam", http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback(ctx)
 
-		var examID int64
+	title := strings.TrimSpace(req.Title)
+	var examID int64
+	err = tx.QueryRow(ctx,
+		`INSERT INTO exams (title, teacher_id, duration_minutes)
+		 VALUES ($1, $2, $3)
+		 RETURNING id`,
+		title, req.TeacherID, req.DurationMinutes,
+	).Scan(&examID)
+	if err != nil {
+		log.Println(err)
+		http.Error(w, "could not save exam", http.StatusInternalServerError)
+		return
+	}
+
+	for _, question := range req.Questions {
+		var questionID int64
 		err = tx.QueryRow(ctx,
-			`INSERT INTO exams (title, teacher_id, duration_minutes)
+			`INSERT INTO questions (exam_id, body, correct_option)
 			 VALUES ($1, $2, $3)
 			 RETURNING id`,
-			strings.TrimSpace(req.Title), req.TeacherID, req.DurationMinutes,
-		).Scan(&examID)
+			examID, strings.TrimSpace(question.Body), question.CorrectOption,
+		).Scan(&questionID)
 		if err != nil {
 			log.Println(err)
 			http.Error(w, "could not save exam", http.StatusInternalServerError)
 			return
 		}
 
-		for _, question := range req.Questions {
-			var questionID int64
-			err = tx.QueryRow(ctx,
-				`INSERT INTO questions (exam_id, body, correct_option)
-				 VALUES ($1, $2, $3)
-				 RETURNING id`,
-				examID, strings.TrimSpace(question.Body), question.CorrectOption,
-			).Scan(&questionID)
+		for number, option := range question.Options {
+			_, err = tx.Exec(ctx,
+				`INSERT INTO options (question_id, option_number, body)
+				 VALUES ($1, $2, $3)`,
+				questionID, number+1, strings.TrimSpace(option),
+			)
 			if err != nil {
 				log.Println(err)
 				http.Error(w, "could not save exam", http.StatusInternalServerError)
 				return
 			}
-
-			for number, option := range question.Options {
-				_, err = tx.Exec(ctx,
-					`INSERT INTO options (question_id, option_number, body)
-					 VALUES ($1, $2, $3)`,
-					questionID, number+1, strings.TrimSpace(option),
-				)
-				if err != nil {
-					log.Println(err)
-					http.Error(w, "could not save exam", http.StatusInternalServerError)
-					return
-				}
-			}
 		}
-
-		if err := tx.Commit(ctx); err != nil {
-			log.Println(err)
-			http.Error(w, "could not save exam", http.StatusInternalServerError)
-			return
-		}
-
-		// The saved list no longer matches the database, so the next read rebuilds it.
-		if err := cache.Del(ctx, "exams:all").Err(); err != nil {
-			log.Println(err)
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusCreated)
-		json.NewEncoder(w).Encode(examResponse{
-			ID:            examID,
-			Title:         strings.TrimSpace(req.Title),
-			QuestionCount: len(req.Questions),
-		})
 	}
+
+	if err := tx.Commit(ctx); err != nil {
+		log.Println(err)
+		http.Error(w, "could not save exam", http.StatusInternalServerError)
+		return
+	}
+
+	// The saved list no longer matches the database, so the next read rebuilds it.
+	if err := a.cache.Del(ctx, "exams:all").Err(); err != nil {
+		log.Println(err)
+	}
+	a.publish(ctx, "exam.created", map[string]any{
+		"exam_id":    examID,
+		"title":      title,
+		"teacher_id": req.TeacherID,
+	})
+
+	writeJSON(w, http.StatusCreated, examResponse{
+		ID:            examID,
+		Title:         title,
+		QuestionCount: len(req.Questions),
+	})
 }
 
 func validateExam(req examRequest) error {
@@ -270,4 +346,10 @@ func validateExam(req examRequest) error {
 		}
 	}
 	return nil
+}
+
+func writeJSON(w http.ResponseWriter, code int, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(value)
 }

@@ -51,6 +51,17 @@ services:
     depends_on:
       - kafka
 
+  # The page we use to call the services during the demonstration.
+  swagger:
+    image: swaggerapi/swagger-ui:latest
+    container_name: swagger
+    ports:
+      - "8083:8080"
+    volumes:
+      - ./openapi.yaml:/usr/share/nginx/html/openapi.yaml
+    environment:
+      URL: openapi.yaml
+
 volumes:
   postgres_data:
   redis_data:

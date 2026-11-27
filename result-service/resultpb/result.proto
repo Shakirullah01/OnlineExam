@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+package result;
+
+option go_package = "github.com/Shakirullah01/OnlineExam/result-service/resultpb";
+
+// Result grades one submitted attempt. This is the only grading path.
+service Result {
+  rpc CalculateResult (CalculateRequest) returns (CalculateResponse);
+}
+
+message CalculateRequest {
+  int64 attempt_id = 1;
+  int64 exam_id = 2;
+  int64 student_id = 3;
+  repeated Answer answers = 4;
+}
+
+message Answer {
+  int32 selected_option = 1;
+  int32 correct_option = 2;
+}
+
+message CalculateResponse {
+  int32 correct_count = 1;
+  int32 total_questions = 2;
+  int32 percentage = 3;
+}

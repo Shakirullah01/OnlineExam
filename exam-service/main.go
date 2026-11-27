@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 )
 
 // schema.sql is packed into the program, so it runs no matter which folder we start from.
@@ -34,6 +35,11 @@ func main() {
 		log.Fatal(err)
 	}
 
+	cache := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+	if err := cache.Ping(ctx).Err(); err != nil {
+		log.Fatal(err)
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		if err := db.Ping(r.Context()); err != nil {
@@ -42,7 +48,8 @@ func main() {
 		}
 		w.Write([]byte("ok"))
 	})
-	mux.HandleFunc("POST /exams", createExam(db))
+	mux.HandleFunc("GET /exams", listExams(db, cache))
+	mux.HandleFunc("POST /exams", createExam(db, cache))
 
 	log.Println("exam-service is listening on http://localhost:8081")
 	log.Fatal(http.ListenAndServe(":8081", mux))
@@ -86,7 +93,70 @@ type examResponse struct {
 	QuestionCount int    `json:"question_count"`
 }
 
-func createExam(db *pgxpool.Pool) http.HandlerFunc {
+type examListItem struct {
+	ID              int64  `json:"id"`
+	Title           string `json:"title"`
+	TeacherID       int64  `json:"teacher_id"`
+	DurationMinutes int    `json:"duration_minutes"`
+}
+
+func listExams(db *pgxpool.Pool, cache *redis.Client) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+
+		cached, err := cache.Get(ctx, "exams:all").Bytes()
+		if err == nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(cached)
+			return
+		}
+		if err != redis.Nil {
+			log.Println(err)
+		}
+
+		rows, err := db.Query(ctx,
+			`SELECT id, title, teacher_id, duration_minutes
+			 FROM exams
+			 ORDER BY id`)
+		if err != nil {
+			log.Println(err)
+			http.Error(w, "could not load exams", http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+
+		exams := []examListItem{}
+		for rows.Next() {
+			var exam examListItem
+			if err := rows.Scan(&exam.ID, &exam.Title, &exam.TeacherID, &exam.DurationMinutes); err != nil {
+				log.Println(err)
+				http.Error(w, "could not load exams", http.StatusInternalServerError)
+				return
+			}
+			exams = append(exams, exam)
+		}
+		if err := rows.Err(); err != nil {
+			log.Println(err)
+			http.Error(w, "could not load exams", http.StatusInternalServerError)
+			return
+		}
+
+		body, err := json.Marshal(exams)
+		if err != nil {
+			log.Println(err)
+			http.Error(w, "could not load exams", http.StatusInternalServerError)
+			return
+		}
+		if err := cache.Set(ctx, "exams:all", body, 0).Err(); err != nil {
+			log.Println(err)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(body)
+	}
+}
+
+func createExam(db *pgxpool.Pool, cache *redis.Client) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req examRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -152,6 +222,11 @@ func createExam(db *pgxpool.Pool) http.HandlerFunc {
 			log.Println(err)
 			http.Error(w, "could not save exam", http.StatusInternalServerError)
 			return
+		}
+
+		// The saved list no longer matches the database, so the next read rebuilds it.
+		if err := cache.Del(ctx, "exams:all").Err(); err != nil {
+			log.Println(err)
 		}
 
 		w.Header().Set("Content-Type", "application/json")
